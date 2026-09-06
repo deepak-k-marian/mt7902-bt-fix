@@ -1,0 +1,1 @@
+savedcmd_hci_bcm4377.ko := ld -r -m elf_x86_64 -z noexecstack --no-warn-rwx-segments --build-id=sha1  -T /usr/src/linux-headers-7.0.0-31-generic/scripts/module.lds -o hci_bcm4377.ko hci_bcm4377.o hci_bcm4377.mod.o .module-common.o
