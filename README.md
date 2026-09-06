@@ -1,203 +1,113 @@
-# NEURAL-GATE 2026 — Backend
+# MT7902 Bluetooth Fix for Ubuntu / Linux
 
-Autonomous AI Proxy Firewall with CNN-based threat detection.
-Acts as a **transparent reverse proxy** between clients and your backend server.
-Every request AND every reply is inspected in real-time.
-
----
-
-## Architecture
+Fixes Bluetooth on laptops with the MediaTek MT7902 (Filogic 310) combo
+WiFi+Bluetooth chip, where the controller never powers on and `dmesg` shows:
 
 ```
-Attacker / Client
-      │
-      ▼
-┌─────────────────────────────────────┐
-│         NEURAL-GATE PROXY           │  ← FastAPI on port 8000
-│                                     │
-│  1. PCAP Capture (raw packet bytes) │
-│  2. IDS Engine  (Snort-style rules) │
-│  3. SIEM Correlator (event store)   │
-│  4. AI Multi-Agent CNN Analysis     │
-│     ├── CNN Header Inspector        │
-│     ├── CNN Body Inspector          │
-│     ├── GRU Temporal Tracker        │
-│     └── Entropy Analyzer            │
-│  5. SOAR Automation (playbooks)     │
-│  6. Firewall (block / allow / deny) │
-│  7. Egress Reply Inspector          │
-└─────────────────────────────────────┘
-      │                     │
-      ▼                     ▼
- Backend Server       SOC Dashboard
- (your app)           WebSocket ws://localhost:8000/ws/soc
+Bluetooth: hci0: Opcode 0x0c03 failed: -110
 ```
 
----
+Tested on: Acer Aspire Lite AL15-41, Ubuntu 26.04, kernel `7.0.0-31-generic`,
+Bluetooth USB ID `13d3:3580`.
 
-## Quick Start
+## Root cause
 
-### 1. Install dependencies
+Stock Ubuntu's `btusb`/`btmtk` drivers don't have the `BTUSB_MEDIATEK` quirk
+entry for this chip's USB ID (`13d3:3580`, and siblings `3579`/`3594`/`3596`).
+Without it, the kernel treats the controller as a generic Bluetooth USB
+device instead of routing it through MediaTek's proper HCI reset and
+firmware-load sequence — so the HCI Reset command times out and the
+controller never comes up.
+
+## What this fix does
+
+- Adds the 4 missing MediaTek USB device-ID quirk entries to `btusb.c`
+- Extends `btmtk.c`'s device-ID switch and reset logic to recognize `0x7902`
+  alongside the existing MediaTek family (`0x7922` / `0x7925` / `0x7961`)
+- Adds a `FIRMWARE_MT7902` macro pointing at the firmware file — which
+  Ubuntu's `linux-firmware-mediatek` package already ships, so nothing
+  extra needs downloading
+- Builds only the two changed modules (`btusb.ko`, `btmtk.ko`) via DKMS,
+  compiled against **your own kernel's real source**, so they load with
+  genuinely matching `vermagic` — no `--force`, no bypassed safety checks
+
+See `PROCESS.md` for the full story of how this was diagnosed and derived,
+including the dead ends that came before it.
+
+## Requirements
+
+- Ubuntu (or another distro with a similar kernel-headers setup)
+- `linux-headers-$(uname -r)` installed and matching your running kernel
+- `dkms`
+
+Install prerequisites:
 ```bash
-pip install -r requirements.txt
+sudo apt install dkms linux-headers-$(uname -r)
 ```
 
-### 2. Train the CNN model (first time only, ~30 seconds)
-```bash
-python scripts/train_model.py
-```
-This generates `app/models/neural_gate_cnn.pt`
-
-### 3. Configure your target server
-Edit `config.py`:
-```python
-TARGET_SERVER = "http://localhost:3000"   # your actual backend
-PROXY_PORT    = 8000
-```
-
-### 4. Run the proxy
-```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 5. Point your clients at port 8000
-Instead of hitting `http://your-server:3000` directly,
-clients hit `http://your-server:8000` — Neural-Gate proxies everything.
-
-### 6. Open the SOC Dashboard
-Open `neural-gate-siem.html` in your browser.
-It connects to `ws://localhost:8000/ws/soc` automatically.
-
----
-
-## Live Attack Demo
-
-The `scripts/` folder contains attack scripts you can run against the proxy:
+## Install
 
 ```bash
-# SQL Injection
-python scripts/attack_sqli.py
-
-# XSS
-python scripts/attack_xss.py
-
-# DDoS flood
-python scripts/attack_ddos.py
-
-# Data exfiltration simulation (triggers egress check)
-python scripts/attack_exfil.py
-
-# Run all attacks in sequence
-python scripts/attack_all.py
+chmod +x install-mt7902-bt.sh uninstall-mt7902-bt.sh
+sudo ./install-mt7902-bt.sh
 ```
 
----
+The install script expects the patched source tree to already exist at
+`/usr/src/mt7902-bt-1.0.0/`. If you're setting this up fresh on a different
+machine, see "Re-deriving the patch" below first.
 
-## REST API
+## Uninstall / rollback
 
-| Method | Endpoint              | Description                        |
-|--------|-----------------------|------------------------------------|
-| GET    | /api/logs             | All incident logs (paginated)      |
-| GET    | /api/logs?type=sqli   | Filter by attack type              |
-| GET    | /api/logs?sev=critical| Filter by severity                 |
-| GET    | /api/stats            | Live counters (blocked, denied...) |
-| GET    | /api/blocklist        | Currently blocked IPs              |
-| DELETE | /api/blocklist/{ip}   | Unblock an IP                      |
-| POST   | /api/killswitch       | Kill all traffic                   |
-| DELETE | /api/killswitch       | Re-enable traffic                  |
-| GET    | /api/agents           | Current CNN agent scores           |
-| GET    | /health               | Health check                       |
-
----
-
-## WebSocket Events (SOC Dashboard)
-
-Connect to `ws://localhost:8000/ws/soc`
-
-Every event is JSON:
-```json
-{
-  "event":     "threat_blocked",
-  "timestamp": "2026-03-07T20:45:12Z",
-  "source_ip": "185.220.101.47",
-  "attack_type": "sqli",
-  "severity":  "critical",
-  "phase":     "CNN → SOAR",
-  "agents": {
-    "header_score": 0.91,
-    "body_score":   0.97,
-    "gru_score":    0.88,
-    "entropy":      7.2
-  },
-  "confidence": 0.97,
-  "action":    "BLOCKED",
-  "message":   "SQL injection detected in POST body targeting /api/login"
-}
+```bash
+sudo ./uninstall-mt7902-bt.sh
 ```
 
-Event types: `threat_blocked`, `reply_denied`, `request_allowed`,
-             `ids_alert`, `soar_action`, `kill_switch`, `agent_update`
+DKMS automatically restores the original stock `btusb.ko`/`btmtk.ko` it
+archived at install time. A second, independent backup of those original
+files is also kept at `~/bt-mt7902-backup/` in case DKMS's own restore
+ever needs a manual fallback.
 
----
+## Verify it worked
 
-## CNN Model Architecture
-
-```
-Input: 1024-byte packet payload as float32 vector
-  │
-  ├── Conv1D(32 filters, kernel=8, ReLU)
-  ├── MaxPool1D(4)
-  ├── Conv1D(64 filters, kernel=4, ReLU)
-  ├── MaxPool1D(4)
-  ├── Conv1D(128 filters, kernel=3, ReLU)
-  ├── AdaptiveAvgPool
-  ├── GRU(hidden=64, layers=2, bidirectional)
-  ├── Dropout(0.4)
-  └── Linear → Sigmoid → P(malicious) [0..1]
+```bash
+sudo dmesg | grep hci0
+bluetoothctl show
+rfkill list
 ```
 
-Threshold: `P > 0.85` → BLOCK
+Expect:
+- `Bluetooth: hci0: Device setup in ... usecs` — **not** `Opcode 0x0c03 failed`
+- `Powered: yes`
+- No soft/hard block
 
----
-
-## IDS Signature Rules
-
-Located in `app/pipeline/ids_rules.py`
-Rules cover: SQLi, XSS, LFI, RFI, Command Injection, XXE, SSRF,
-             Port Scans, DDoS patterns, Shellcode, Reverse shells
-
----
-
-## File Structure
-
+The real test is a suspend/resume cycle, not just a cold boot — this bug
+was intermittent on cold boot but reliably reproduced on resume:
+```bash
+systemctl suspend
+# wake it back up, then:
+sudo dmesg | grep hci0
 ```
-neural-gate/
-├── app/
-│   ├── main.py              # FastAPI app, proxy logic, WebSocket
-│   ├── config.py            # All configuration
-│   ├── agents/
-│   │   ├── cnn_model.py     # PyTorch CNN+GRU model definition
-│   │   ├── header_agent.py  # CNN Header Inspector
-│   │   ├── body_agent.py    # CNN Body Inspector
-│   │   ├── gru_agent.py     # GRU Temporal Tracker
-│   │   ├── entropy_agent.py # Entropy Analyzer
-│   │   └── egress_agent.py  # Reply Inspector (exfiltration)
-│   ├── pipeline/
-│   │   ├── pcap_capture.py  # Packet capture & feature extraction
-│   │   ├── ids_engine.py    # Snort-style signature matching
-│   │   ├── siem.py          # Event correlation & log store
-│   │   └── soar.py          # Automated response playbooks
-│   └── api/
-│       ├── routes.py        # REST API routes
-│       └── websocket.py     # SOC WebSocket manager
-├── scripts/
-│   ├── train_model.py       # Train CNN on synthetic data
-│   ├── attack_sqli.py       # SQLi attack demo
-│   ├── attack_xss.py        # XSS attack demo
-│   ├── attack_ddos.py       # DDoS attack demo
-│   ├── attack_exfil.py      # Exfiltration attack demo
-│   └── attack_all.py        # Run all attacks
-├── config.py                # Root config
-├── requirements.txt
-└── README.md
+
+## Re-deriving the patch (for a different kernel version)
+
+This fix edits Ubuntu's own kernel source directly, not a foreign snapshot,
+so it needs to be re-derived if you're on a different kernel:
+
+```bash
+apt-get source linux-image-unsigned-$(uname -r)
 ```
+
+Then apply the same edits described in `PROCESS.md` step 6 to your fetched
+`drivers/bluetooth/btusb.c`, `btmtk.c`, and `btmtk.h`, and rebuild the DKMS
+package pointing `dkms.conf` at that source.
+
+## Known limitations
+
+- **Bluetooth only.** This chip's WiFi half needs a separate, more invasive
+  fix — different MCU ring/queue layout, not just a device-ID table entry —
+  and isn't covered by this repo (yet).
+- Tied to the exact kernel source it was built against. A future kernel
+  update that meaningfully changes `drivers/bluetooth/btusb.c`/`btmtk.c`
+  may require re-deriving the patch (see above) rather than just rebuilding.
+- MediaTek has since posted an official upstream patch series for this chip
+  family; once that lands in a stock kernel, this fix becomes unnecessary.
